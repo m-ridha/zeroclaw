@@ -32,15 +32,29 @@ impl Fixture {
         long_running: u64,
         configure: impl FnOnce(&mut Config),
     ) -> Self {
+        Self::with_response_gate(ordinary, long_running, configure, None).await
+    }
+
+    async fn with_response_gate(
+        ordinary: u64,
+        long_running: u64,
+        configure: impl FnOnce(&mut Config),
+        response_gate: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> Self {
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = requests.clone();
         let app = Router::new().route(
             "/v1/chat/completions",
             post(move |Json(request): Json<Value>| {
                 let counter = counter.clone();
+                let response_gate = response_gate.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    if let Some(gate) = response_gate {
+                        gate.acquire().await.unwrap().forget();
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
                     if request["stream"] == true {
                         let chunk = json!({"id": "timeout-fixture", "model": "fixture-model",
                             "choices": [{"index": 0, "delta": {"content": "completed"}}]});
@@ -255,9 +269,13 @@ fn webhook_body_receipt_uses_the_long_running_deadline() {
 #[test]
 fn webhook_retry_after_marker_expiry_can_overlap_an_active_turn() {
     run(async || {
-        let fixture = Fixture::configured(1, 10, |config| {
-            config.gateway.idempotency_ttl_secs = 1;
-        })
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let fixture = Fixture::with_response_gate(
+            1,
+            20,
+            |config| config.gateway.idempotency_ttl_secs = 1,
+            Some(response_gate.clone()),
+        )
         .await;
         let request = || {
             fixture.post(
@@ -269,13 +287,13 @@ fn webhook_retry_after_marker_expiry_can_overlap_an_active_turn() {
         let first = request();
         tokio::pin!(first);
         let wait_for_calls = async |expected| {
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
                 while fixture.requests.load(Ordering::SeqCst) < expected {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .unwrap();
+            .expect("provider request admission");
         };
         let expired = async {
             wait_for_calls(1).await;
@@ -294,6 +312,9 @@ fn webhook_retry_after_marker_expiry_can_overlap_an_active_turn() {
             result = &mut retry => panic!("retry ended before overlapping provider call: {result:?}"),
             () = wait_for_calls(2) => {}
         }
+        // Release responses only after both calls have reached the provider.
+        // Scheduler delays cannot complete the first turn before overlap.
+        response_gate.add_permits(2);
         let (first, retry) = tokio::join!(first, retry);
         assert_eq!(first.0, 200, "{}", first.1);
         assert_eq!(retry.0, 200, "{}", retry.1);
